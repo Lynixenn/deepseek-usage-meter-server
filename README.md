@@ -4,12 +4,10 @@ Server side of the DeepSeek usage meter. Serves live DeepSeek pricing and balanc
 
 ## Install
 
-Copy this folder to your SillyTavern install:
+From inside your SillyTavern folder:
 
 ```
-plugins/deepseek-usage-meter
+git clone https://github.com/Lynixenn/deepseek-usage-meter-plugin plugins/deepseek-usage-meter && git clone https://github.com/Lynixenn/deepseek-usage-meter-extension data/default-user/extensions/ui-extension
 ```
 
-Restart the server. It uses the DeepSeek API key already saved in SillyTavern, no extra config.
-
-You also need the UI extension: https://github.com/Lynixenn/deepseek-usage-meter-extension
+Restart the server and refresh the page. It uses the DeepSeek API key already saved in SillyTavern, no extra config.
