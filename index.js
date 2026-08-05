@@ -5,7 +5,7 @@ import { readSecret, SECRET_KEYS } from '../../src/endpoints/secrets.js';
 export const info = {
     id: 'deepseek-usage-meter',
     name: 'DeepSeek Usage Meter',
-    description: 'Tracks DeepSeek API usage and balance; captures token usage from proxied requests.',
+    description: 'Tracks DeepSeek API usage and balance from chat-completion responses.',
 };
 
 const PRICING_URL = 'https://api-docs.deepseek.com/quick_start/pricing/';
@@ -22,9 +22,6 @@ const FALLBACK_PEAK_HOURS = [
     { start: 14 * 60, end: 18 * 60 },
 ]; // Beijing time (UTC+8), daily
 const FALLBACK_PEAK_MULTIPLIER = 2;
-
-// Single-consumer queue: the UI extension drains one usage record per finished generation.
-const usageQueue = [];
 
 const authorize = (req, res, next) => {
     const token = req.header('X-Meter-Token') || '';
@@ -170,86 +167,6 @@ export function init(router) {
         }
     });
 
-    router.get('/usage/latest', (req, res) => {
-        const item = usageQueue.shift();
-        return item ? res.json(item) : res.status(204).send();
-    });
-
-    const usageFrom = body => body?.usage && {
-        model: body.model,
-        prompt_tokens: body.usage.prompt_tokens ?? 0,
-        prompt_cache_hit_tokens: body.usage.prompt_cache_hit_tokens ?? 0,
-        prompt_cache_miss_tokens: body.usage.prompt_cache_miss_tokens ?? 0,
-        completion_tokens: body.usage.completion_tokens ?? 0,
-        total_tokens: body.usage.total_tokens ?? 0,
-        captured_at: new Date().toISOString(),
-    };
-
-    router.all('/proxy/*', async (req, res) => {
-        const key = deepseekKey(req);
-        if (!key) return res.status(400).json({ error: 'No DeepSeek key configured' });
-
-        const path = req.params[0];
-        const body = req.body && typeof req.body === 'object' ? { ...req.body } : req.body;
-        if (body && typeof body === 'object' && body.stream) {
-            body.stream_options = { ...(body.stream_options || {}), include_usage: true };
-        }
-
-        try {
-            const upstream = await fetch(`https://api.deepseek.com/${path}`, {
-                method: req.method,
-                headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-                body: ['GET', 'HEAD'].includes(req.method) ? undefined : JSON.stringify(body),
-                signal: AbortSignal.timeout(300000),
-            });
-
-            const contentType = upstream.headers.get('content-type') || '';
-            if (!contentType.includes('text/event-stream')) {
-                const data = await upstream.json();
-                const usage = usageFrom(data);
-                if (usage) usageQueue.push(usage);
-                return res.status(upstream.status).json(data);
-            }
-
-            if (!upstream.ok) {
-                const data = await upstream.json();
-                return res.status(upstream.status).json(data);
-            }
-
-            res.status(200);
-            res.header('content-type', 'text/event-stream');
-            res.header('cache-control', 'no-cache');
-            res.flushHeaders();
-
-            const decoder = new TextDecoder();
-            let pending = '';
-            for await (const chunk of upstream.body) {
-                const text = decoder.decode(chunk, { stream: true });
-                res.write(text);
-                pending += text;
-                const lines = pending.split('\n');
-                pending = lines.pop() || '';
-                for (const line of lines) {
-                    if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
-                    try {
-                        const usage = usageFrom(JSON.parse(line.slice(6)));
-                        if (usage) usageQueue.push(usage);
-                    } catch { /* ignore malformed SSE lines */ }
-                }
-            }
-            res.end();
-        } catch (err) {
-            console.error('[DeepSeek Usage Meter proxy]', err.message);
-            if (!res.headersSent) {
-                res.status(500).json({ error: 'Proxy request failed' });
-            } else {
-                res.end();
-            }
-        }
-    });
-
     console.log('[DeepSeek Usage Meter] Plugin loaded');
 }
-
-export default { info, init };
 
