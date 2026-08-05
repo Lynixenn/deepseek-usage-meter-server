@@ -1,5 +1,5 @@
 {
-  "name": "deepseek-usage-meter-plugin",
+  "name": "deepseek-usage-meter-server",
   "private": true,
   "type": "module",
   "description": "SillyTavern server plugin for DeepSeek usage tracking and balance",
