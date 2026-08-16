@@ -79,18 +79,29 @@ function parsePricingPage(html) {
 
     if (Object.keys(prices).length === 0) return null;
 
-    // "Peak hours: 9:00–12:00 and 14:00–18:00 (Beijing Time, UTC+8) daily"
-    const peakMatch = html.match(/Peak hours:\s*(\d{1,2}):(\d{2})[^\d]+(\d{1,2}):(\d{2})[^\d]+(\d{1,2}):(\d{2})[^\d]+(\d{1,2}):(\d{2})/);
-    // "During peak hours, prices will be 2x the regular prices"
+    // "Peak hours are 01:00 - 04:00 and 06:00 - 10:00 UTC" (new, UTC-based) or
+    // "Peak hours: 9:00–12:00 and 14:00–18:00 (Beijing Time, UTC+8) daily" (old).
+    const peakMatch = html.match(/Peak hours\b[^0-9]{0,24}(\d{1,2}):(\d{2})[^\d]+(\d{1,2}):(\d{2})[^\d]+(\d{1,2}):(\d{2})[^\d]+(\d{1,2}):(\d{2})/i);
+    // The new page states the window in UTC; convert to Beijing minutes to match the rest of the plugin.
+    // The zone word sits after the last time, so test a window past the match start.
+    const zone = peakMatch && html.slice(peakMatch.index, peakMatch.index + 120);
+    const utcTimes = !!zone && /utc/i.test(zone) && !/beijing/i.test(zone);
+    const toBeijing = (h, m) => {
+        const min = Number(h) * 60 + Number(m);
+        return utcTimes ? (min + BEIJING_OFFSET_MIN) % (24 * 60) : min;
+    };
+    // "During peak hours, prices will be 2x the regular prices" (old) or
+    // "Off-peak rates are half of the peak rates" (new).
     const multMatch = html.match(/(\d+)x the regular prices/);
+    const halfMatch = /half of the peak rates/i.test(html);
 
     return {
         models: prices,
         peakHours: peakMatch ? [
-            { start: Number(peakMatch[1]) * 60 + Number(peakMatch[2]), end: Number(peakMatch[3]) * 60 + Number(peakMatch[4]) },
-            { start: Number(peakMatch[5]) * 60 + Number(peakMatch[6]), end: Number(peakMatch[7]) * 60 + Number(peakMatch[8]) },
+            { start: toBeijing(peakMatch[1], peakMatch[2]), end: toBeijing(peakMatch[3], peakMatch[4]) },
+            { start: toBeijing(peakMatch[5], peakMatch[6]), end: toBeijing(peakMatch[7], peakMatch[8]) },
         ] : FALLBACK_PEAK_HOURS,
-        peakMultiplier: multMatch ? Number(multMatch[1]) : FALLBACK_PEAK_MULTIPLIER,
+        peakMultiplier: multMatch ? Number(multMatch[1]) : halfMatch ? 2 : FALLBACK_PEAK_MULTIPLIER,
     };
 }
 
