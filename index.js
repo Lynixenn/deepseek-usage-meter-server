@@ -12,10 +12,14 @@ const PRICING_URL = 'https://api-docs.deepseek.com/quick_start/pricing/';
 const PRICING_TTL_MS = 60 * 60 * 1000; // Re-fetch the pricing page hourly.
 const BEIJING_OFFSET_MIN = 8 * 60;
 
-// Fallback prices (USD per 1M tokens) and peak schedule, mirroring the DeepSeek pricing page.
+// Fallback prices (USD per 1M tokens) and peak schedule, mirroring the DeepSeek
+// pricing page. These are the OFF-PEAK base rates; the peak multiplier (2x) is
+// applied on top, so a fallback only reaches the announced peak prices when the
+// base is the off-peak rate (not the pre-switch flat rate).
 const FALLBACK_MODELS = {
-    'deepseek-v4-flash': { cache_hit: 0.0028, cache_miss: 0.14, output: 0.28 },
-    'deepseek-v4-pro': { cache_hit: 0.003625, cache_miss: 0.435, output: 0.87 },
+    'deepseek-v4-flash': { cache_hit: 0.007, cache_miss: 0.22, output: 0.66 },
+    'deepseek-v4-pro': { cache_hit: 0.022, cache_miss: 0.66, output: 1.98 },
+    'deepseek-v4-flash-vision-exp': { cache_hit: 0.007, cache_miss: 0.22, output: 0.66 },
 };
 const FALLBACK_PEAK_HOURS = [
     { start: 9 * 60, end: 12 * 60 },
@@ -64,13 +68,18 @@ function parsePricingPage(html) {
             continue;
         }
 
-        const label = cells.find(c => c.includes('1M INPUT TOKENS (CACHE HIT)') || c.includes('1M INPUT TOKENS (CACHE MISS)') || c.includes('1M OUTPUT TOKENS'));
-        if (!label) continue;
+        // The page renders the metric header as `1M INPUT TOKENS<br>(CACHE HIT)`,
+        // which tag-strips to `1M INPUT TOKENS(CACHE HIT)` (no space before the
+        // paren), so match with optional whitespace rather than a fixed literal.
+        const key = cells
+            .map(cell => /1M INPUT TOKENS\s*\(CACHE HIT\)/i.test(cell) ? 'cache_hit'
+                : /1M INPUT TOKENS\s*\(CACHE MISS\)/i.test(cell) ? 'cache_miss'
+                : /1M OUTPUT TOKENS/i.test(cell) ? 'output' : null)
+            .find(k => k !== null);
+        if (!key) continue;
 
-        const values = cells.map(c => Number(c.replace('$', ''))).filter(v => Number.isFinite(v) && v > 0);
+        const values = cells.map(c => Number(c.replace(/[$,]/g, ''))).filter(v => Number.isFinite(v) && v > 0);
         if (values.length < models.length) continue;
-
-        const key = label.includes('CACHE HIT') ? 'cache_hit' : label.includes('CACHE MISS') ? 'cache_miss' : 'output';
         models.forEach((model, i) => {
             prices[model] ??= {};
             prices[model][key] = values[i];
