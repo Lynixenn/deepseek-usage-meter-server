@@ -46,7 +46,13 @@ const deepseekKey = req => {
 
 const beijingMinutes = (date = new Date()) => (date.getUTCHours() * 60 + date.getUTCMinutes() + BEIJING_OFFSET_MIN) % (24 * 60);
 
-const isPeak = (peakHours, minutes = beijingMinutes()) => peakHours.some(({ start, end }) => minutes >= start && minutes < end);
+// Beijing day-of-week (0=Sun..6=Sat). The pricing page makes weekends (Sat/Sun,
+// Beijing) all-off-peak, so peak billing must skip those days.
+const beijingDay = (date = new Date()) => new Date(date.getTime() + BEIJING_OFFSET_MIN * 60000).getUTCDay();
+
+const isPeak = (peakHours, minutes = beijingMinutes(), weekendOffPeak = false) =>
+    (!weekendOffPeak || (beijingDay() !== 0 && beijingDay() !== 6)) &&
+    peakHours.some(({ start, end }) => minutes >= start && minutes < end);
 
 const fmtMinutes = m => `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
 
@@ -92,9 +98,12 @@ function parsePricingPage(html) {
     // "Peak hours: 9:00–12:00 and 14:00–18:00 (Beijing Time, UTC+8) daily" (old).
     const peakMatch = html.match(/Peak hours\b[^0-9]{0,24}(\d{1,2}):(\d{2})[^\d]+(\d{1,2}):(\d{2})[^\d]+(\d{1,2}):(\d{2})[^\d]+(\d{1,2}):(\d{2})/i);
     // The new page states the window in UTC; convert to Beijing minutes to match the rest of the plugin.
-    // The zone word sits after the last time, so test a window past the match start.
-    const zone = peakMatch && html.slice(peakMatch.index, peakMatch.index + 120);
-    const utcTimes = !!zone && /utc/i.test(zone) && !/beijing/i.test(zone);
+    // The zone word sits immediately AFTER the last time ("... 10:00 UTC"). A window
+    // starting at the match start bleeds into the FOLLOWING sentence, which also
+    // mentions "Beijing Time" (the pricing-adjustment notice), defeating the
+    // !/beijing/ guard. Look right after the matched times instead.
+    const afterTimes = peakMatch && html.slice(peakMatch.index + peakMatch[0].length, peakMatch.index + peakMatch[0].length + 40);
+    const utcTimes = !!afterTimes && /utc/i.test(afterTimes) && !/beijing/i.test(afterTimes);
     const toBeijing = (h, m) => {
         const min = Number(h) * 60 + Number(m);
         return utcTimes ? (min + BEIJING_OFFSET_MIN) % (24 * 60) : min;
@@ -103,6 +112,9 @@ function parsePricingPage(html) {
     // "Off-peak rates are half of the peak rates" (new).
     const multMatch = html.match(/(\d+)x the regular prices/);
     const halfMatch = /half of the peak rates/i.test(html);
+    // "off-peak rates applying throughout the day on weekends (Saturdays and
+    // Sundays, Beijing Time)" - weekends become all-off-peak.
+    const weekendOffPeak = /off-peak rates applying throughout the day on weekends/i.test(html);
 
     return {
         models: prices,
@@ -111,6 +123,7 @@ function parsePricingPage(html) {
             { start: toBeijing(peakMatch[5], peakMatch[6]), end: toBeijing(peakMatch[7], peakMatch[8]) },
         ] : FALLBACK_PEAK_HOURS,
         peakMultiplier: multMatch ? Number(multMatch[1]) : halfMatch ? 2 : FALLBACK_PEAK_MULTIPLIER,
+        weekendOffPeak,
     };
 }
 
@@ -127,7 +140,7 @@ async function fetchPricing() {
     } catch (err) {
         console.debug('[DeepSeek Usage Meter] Pricing fetch failed, using fallback:', err.message);
     }
-    return { models: FALLBACK_MODELS, peakHours: FALLBACK_PEAK_HOURS, peakMultiplier: FALLBACK_PEAK_MULTIPLIER, source: 'fallback' };
+    return { models: FALLBACK_MODELS, peakHours: FALLBACK_PEAK_HOURS, peakMultiplier: FALLBACK_PEAK_MULTIPLIER, weekendOffPeak: false, source: 'fallback' };
 }
 
 let pricingCache = null;
@@ -148,7 +161,7 @@ export function init(router) {
     router.get('/pricing', async (req, res) => {
         try {
             const pricing = await getPricing();
-            const peak = isPeak(pricing.peakHours);
+            const peak = isPeak(pricing.peakHours, beijingMinutes(), pricing.weekendOffPeak);
             const multiplier = peak ? pricing.peakMultiplier : 1;
             const effective = Object.fromEntries(Object.entries(pricing.models).map(([model, p]) => [model, {
                 cache_hit: p.cache_hit * multiplier,
@@ -160,6 +173,7 @@ export function init(router) {
                 effective,
                 peak,
                 peakMultiplier: pricing.peakMultiplier,
+                weekendOffPeak: pricing.weekendOffPeak,
                 peakHours: pricing.peakHours.map(h => ({ start: fmtMinutes(h.start), end: fmtMinutes(h.end) })),
                 beijingTime: fmtMinutes(beijingMinutes()),
                 source: pricing.source,
