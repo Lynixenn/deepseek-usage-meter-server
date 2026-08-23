@@ -113,8 +113,12 @@ function parsePricingPage(html) {
     const multMatch = html.match(/(\d+)x the regular prices/);
     const halfMatch = /half of the peak rates/i.test(html);
     // "off-peak rates applying throughout the day on weekends (Saturdays and
-    // Sundays, Beijing Time)" - weekends become all-off-peak.
-    const weekendOffPeak = /off-peak rates applying throughout the day on weekends/i.test(html);
+    // Sundays, Beijing Time)" - weekends become all-off-peak. The page now
+    // states it as "… UTC, Monday through Friday (all other hours are
+    // off-peak)", so match both wordings.
+    const weekendOffPeak = /off-peak rates applying throughout the day on weekends/i.test(html) ||
+        /monday\s+through\s+friday/i.test(html) ||
+        /monday\s*[-–]\s*friday/i.test(html);
 
     return {
         models: prices,
