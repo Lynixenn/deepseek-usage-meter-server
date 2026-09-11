@@ -56,6 +56,9 @@ const isPeak = (peakHours, minutes = beijingMinutes(), weekendOffPeak = false) =
 
 const fmtMinutes = m => `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
 
+/** Drop a trailing footnote marker like `(2)` from a model-name cell. */
+const stripFootnote = cell => cell.replace(/\(\d+\)\s*$/, '').trim();
+
 /**
  * Parse the DeepSeek pricing page (Docusaurus HTML). Returns null if the expected
  * table cannot be found, so callers fall back to the built-in table.
@@ -70,7 +73,9 @@ function parsePricingPage(html) {
         if (!cells.length) continue;
 
         if (cells[0] === 'MODEL') {
-            models.push(...cells.slice(1).filter(Boolean));
+            // Model names carry footnote markers in the header (`deepseek-v4-pro(2)`),
+            // which must be stripped so keys match the API model ids.
+            models.push(...cells.slice(1).map(stripFootnote).filter(Boolean));
             continue;
         }
 
