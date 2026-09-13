@@ -1,6 +1,13 @@
 # DeepSeek Usage Meter (plugin)
 
-Server side of the DeepSeek usage meter. Serves live DeepSeek pricing and balance to the UI extension.
+Server side of the usage meter. Serves live DeepSeek and Ollama Cloud pricing, the DeepSeek balance, and the Ollama account quota to the UI extension.
+
+## Endpoints
+
+- `GET /api/plugins/deepseek-usage-meter/pricing` — DeepSeek rates + peak schedule, scraped from api-docs.deepseek.com
+- `GET /api/plugins/deepseek-usage-meter/balance` — DeepSeek balance, using the key already saved in SillyTavern
+- `GET /api/plugins/deepseek-usage-meter/ollama/pricing` — Ollama rates + peak card, scraped from ollama.com/pricing
+- `GET /api/plugins/deepseek-usage-meter/ollama/usage` — Ollama session/weekly quota; requires an `X-Ollama-Key` header (the UI sends the key from its settings, nothing is stored here)
 
 ## Install
 

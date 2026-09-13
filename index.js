@@ -162,6 +162,95 @@ async function getPricing() {
     return pricingCache.data;
 }
 
+// --- Ollama Cloud ---------------------------------------------------------
+// Ollama publishes its rate card as a static HTML page (two tables: normal
+// rates, then the peak surcharge) and states the peak window in UTC, so this is
+// simpler than the Beijing-time DeepSeek schedule: no timezone shifting, and
+// only the DeepSeek models on that page carry a peak rate.
+const OLLAMA_PRICING_URL = 'https://ollama.com/pricing';
+const OLLAMA_USAGE_URL = 'https://ollama.com/api/usage';
+const OLLAMA_PEAK_MULTIPLIER = 2;
+
+const FALLBACK_OLLAMA_MODELS = {
+    'deepseek-v4.1-flash': { cache_hit: 0.003, cache_miss: 0.15, output: 0.6 },
+    'deepseek-v4-flash': { cache_hit: 0.007, cache_miss: 0.22, output: 0.66 },
+    'deepseek-v4-pro': { cache_hit: 0.022, cache_miss: 0.66, output: 1.98 },
+};
+const FALLBACK_OLLAMA_PEAK_HOURS = [{ start: 12 * 60, end: 18 * 60 }]; // UTC, Mon-Fri
+
+/**
+ * Parse the Ollama pricing page. Table #1 is the normal rate card, table #2 the
+ * peak rate card; both share the `Model | Input | Cached input | Output` header.
+ * Returns null when the rate card is missing so callers use the built-in table.
+ */
+function parseOllamaPricingPage(html) {
+    const tables = [...html.matchAll(/<table[\s\S]*?<\/table>/g)].map(table =>
+        [...table[0].matchAll(/<tr[\s\S]*?<\/tr>/g)].map(row =>
+            [...row[0].matchAll(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/g)].map(cell => cell[1].replace(/<[^>]+>/g, '').trim())));
+
+    const toModels = rows => {
+        const head = rows?.[0] ?? [];
+        const at = name => head.indexOf(name);
+        const [iIn, iHit, iOut] = [at('Input'), at('Cached input'), at('Output')];
+        if (iIn < 0 || iHit < 0 || iOut < 0) return null;
+        const num = value => Number(String(value ?? '').replace(/[$,]/g, ''));
+        const models = {};
+        for (const cells of rows.slice(1)) {
+            const cache_miss = num(cells[iIn]);
+            const output = num(cells[iOut]);
+            // '-' in the cached column means the model has no cache discount, so
+            // every input token bills at the normal rate.
+            const cache_hit = Number.isFinite(num(cells[iHit])) ? num(cells[iHit]) : cache_miss;
+            if (!cells[0] || ![cache_miss, output].every(Number.isFinite)) continue;
+            models[cells[0]] = { cache_hit, cache_miss, output };
+        }
+        return Object.keys(models).length ? models : null;
+    };
+
+    const [rateCard, peakCard] = tables.map(toModels);
+    if (!rateCard) return null;
+
+    // "Peak pricing applies between 12:00 and 18:00 UTC, Monday to Friday."
+    const rule = html.match(/Peak pricing applies between (\d{1,2}):(\d{2}) and (\d{1,2}):(\d{2}) UTC/i);
+    return {
+        models: rateCard,
+        peakModels: peakCard ?? {},
+        peakHours: rule
+            ? [{ start: Number(rule[1]) * 60 + Number(rule[2]), end: Number(rule[3]) * 60 + Number(rule[4]) }]
+            : FALLBACK_OLLAMA_PEAK_HOURS,
+    };
+}
+
+const isOllamaPeak = (peakHours, date = new Date()) => {
+    const day = date.getUTCDay();
+    if (day === 0 || day === 6) return false; // weekends are off-peak all day
+    const minutes = date.getUTCHours() * 60 + date.getUTCMinutes();
+    return peakHours.some(({ start, end }) => minutes >= start && minutes < end);
+};
+
+async function fetchOllamaPricing() {
+    try {
+        const response = await fetch(OLLAMA_PRICING_URL, { signal: AbortSignal.timeout(10000) });
+        if (response.ok) {
+            const parsed = parseOllamaPricingPage(await response.text());
+            if (parsed) return { ...parsed, source: 'live' };
+        }
+    } catch (err) {
+        console.debug('[DeepSeek Usage Meter] Ollama pricing fetch failed, using fallback:', err.message);
+    }
+    return { models: FALLBACK_OLLAMA_MODELS, peakModels: {}, peakHours: FALLBACK_OLLAMA_PEAK_HOURS, source: 'fallback' };
+}
+
+let ollamaPricingCache = null;
+
+async function getOllamaPricing() {
+    const now = Date.now();
+    if (!ollamaPricingCache || now - ollamaPricingCache.at > PRICING_TTL_MS) {
+        ollamaPricingCache = { at: now, data: await fetchOllamaPricing() };
+    }
+    return ollamaPricingCache.data;
+}
+
 export function init(router) {
     router.use(authorize);
 
@@ -207,6 +296,48 @@ export function init(router) {
         } catch (err) {
             console.error('[DeepSeek Usage Meter]', err.message);
             return res.status(500).json({ error: 'Balance request failed' });
+        }
+    });
+
+    // Ollama Cloud prices, scraped from ollama.com/pricing. Peak applies to the
+    // DeepSeek models only, so `effective` overlays the peak card on the base card.
+    router.get('/ollama/pricing', async (req, res) => {
+        try {
+            const pricing = await getOllamaPricing();
+            const peak = isOllamaPeak(pricing.peakHours);
+            res.json({
+                models: pricing.models,
+                effective: peak ? { ...pricing.models, ...pricing.peakModels } : pricing.models,
+                peakModels: pricing.peakModels,
+                peak,
+                peakMultiplier: OLLAMA_PEAK_MULTIPLIER,
+                peakHours: pricing.peakHours.map(h => ({ start: fmtMinutes(h.start), end: fmtMinutes(h.end) })),
+                peakDays: 'Mon-Fri',
+                utcTime: fmtMinutes(new Date().getUTCHours() * 60 + new Date().getUTCMinutes()),
+                source: pricing.source,
+                fetchedAt: new Date(ollamaPricingCache.at).toISOString(),
+            });
+        } catch (err) {
+            console.error('[DeepSeek Usage Meter]', err.message);
+            res.status(500).json({ error: 'Ollama pricing request failed' });
+        }
+    });
+
+    // Session/weekly quota windows. Ollama API keys are not part of ST's secret
+    // store, so the UI passes one per request; it is forwarded and never stored.
+    router.get('/ollama/usage', async (req, res) => {
+        try {
+            const key = req.header('X-Ollama-Key') || '';
+            if (!key) return res.status(400).json({ error: 'No Ollama API key configured' });
+            const upstream = await fetch(OLLAMA_USAGE_URL, {
+                headers: { Authorization: `Bearer ${key}`, Accept: 'application/json' },
+                signal: AbortSignal.timeout(15000),
+            });
+            const body = await upstream.json();
+            return res.status(upstream.status).json(body);
+        } catch (err) {
+            console.error('[DeepSeek Usage Meter]', err.message);
+            return res.status(500).json({ error: 'Ollama usage request failed' });
         }
     });
 
