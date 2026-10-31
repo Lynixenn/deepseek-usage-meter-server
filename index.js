@@ -168,7 +168,7 @@ async function getPricing() {
 // simpler than the Beijing-time DeepSeek schedule: no timezone shifting, and
 // only the DeepSeek models on that page carry a peak rate.
 const OLLAMA_PRICING_URL = 'https://ollama.com/pricing';
-const OLLAMA_USAGE_URL = 'https://ollama.com/api/usage';
+const OLLAMA_BALANCE_URL = 'https://ollama.com/api/balance';
 const OLLAMA_PEAK_MULTIPLIER = 2;
 
 const FALLBACK_OLLAMA_MODELS = {
@@ -179,8 +179,17 @@ const FALLBACK_OLLAMA_MODELS = {
 const FALLBACK_OLLAMA_PEAK_HOURS = [{ start: 12 * 60, end: 18 * 60 }]; // UTC, Mon-Fri
 
 /**
- * Parse the Ollama pricing page. Table #1 is the normal rate card, table #2 the
- * peak rate card; both share the `Model | Input | Cached input | Output` header.
+ * Parse the Ollama pricing page. The table used to be split into two cards
+ * (normal rates, then the peak surcharge); it is now a single table that keeps
+ * the same `Model | Input | Cached input | Output` header and marks the peak
+ * rows per model with a `(Peak)` suffix, leaving the plain row as the off-peak
+ * rate. Both layouts are handled:
+ *
+ * - single card with `(Peak)`/`(Off-Peak)` rows: the plain row is the base and
+ *   the `(Peak)` row the surcharge, the `(Off-Peak)` row is dropped (it is
+ *   either the same plain row or redundant);
+ * - two cards (legacy): the first is the base card, the second the peak one.
+ *
  * Returns null when the rate card is missing so callers use the built-in table.
  */
 function parseOllamaPricingPage(html) {
@@ -188,33 +197,89 @@ function parseOllamaPricingPage(html) {
         [...table[0].matchAll(/<tr[\s\S]*?<\/tr>/g)].map(row =>
             [...row[0].matchAll(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/g)].map(cell => cell[1].replace(/<[^>]+>/g, '').trim())));
 
-    const toModels = rows => {
+    const toRows = rows => {
         const head = rows?.[0] ?? [];
         const at = name => head.indexOf(name);
         const [iIn, iHit, iOut] = [at('Input'), at('Cached input'), at('Output')];
         if (iIn < 0 || iHit < 0 || iOut < 0) return null;
         const num = value => Number(String(value ?? '').replace(/[$,]/g, ''));
-        const models = {};
+        const out = [];
         for (const cells of rows.slice(1)) {
+            const name = cells[0];
             const cache_miss = num(cells[iIn]);
             const output = num(cells[iOut]);
+            if (!name || ![cache_miss, output].every(Number.isFinite)) continue;
             // '-' in the cached column means the model has no cache discount, so
             // every input token bills at the normal rate.
             const cache_hit = Number.isFinite(num(cells[iHit])) ? num(cells[iHit]) : cache_miss;
-            if (!cells[0] || ![cache_miss, output].every(Number.isFinite)) continue;
-            models[cells[0]] = { cache_hit, cache_miss, output };
+            out.push({ name, price: { cache_hit, cache_miss, output } });
         }
-        return Object.keys(models).length ? models : null;
+        return out.length ? out : null;
     };
 
-    const [rateCard, peakCard] = tables.map(toModels);
-    if (!rateCard) return null;
+    const cards = tables.map(toRows).filter(Boolean);
+    if (!cards.length) return null;
 
-    // "Peak pricing applies between 12:00 and 18:00 UTC, Monday to Friday."
-    const rule = html.match(/Peak pricing applies between (\d{1,2}):(\d{2}) and (\d{1,2}):(\d{2}) UTC/i);
+    const models = {};
+    const peakModels = {};
+    const isPeakName = name => /\(\s*peak\s*\)$/i.test(name);
+    const isOffPeakName = name => /\(\s*off-?\s*peak\s*\)$/i.test(name);
+    const stripTag = name => name.replace(/\s*\(\s*(?:off-?\s*)?peak\s*\)$/i, '').trim();
+
+    // Single card: the plain row is the standard (peak) rate and a sibling
+    // `(Off-Peak)` row carries the discounted rate, so the base card takes the
+    // off-peak value and the surcharge card takes the plain one. A model with no
+    // sibling row has a single flat rate and must not be treated as peak.
+    const isTagged = cards.length === 1 && cards[0].some(({ name }) => isPeakName(name) || isOffPeakName(name));
+    if (isTagged) {
+        const byModel = {};
+        for (const { name, price } of cards[0]) {
+            const key = stripTag(name);
+            if (!key) continue;
+            const slot = byModel[key] ?? (byModel[key] = { plain: null, offPeak: null, peak: null });
+            if (isPeakName(name)) slot.peak = price;
+            else if (isOffPeakName(name)) slot.offPeak = price;
+            else slot.plain = price;
+        }
+        for (const [key, slot] of Object.entries(byModel)) {
+            const base = slot.offPeak ?? slot.plain ?? slot.peak;
+            if (base) models[key] = base;
+            // Only a model whose peak rate actually differs gets a surcharge row;
+            // otherwise the base card is used for both and `effective` is a no-op.
+            const peak = slot.peak ?? (slot.offPeak ? slot.plain : null);
+            if (peak && (!base || peak.cache_miss !== base.cache_miss || peak.cache_hit !== base.cache_hit || peak.output !== base.output)) {
+                peakModels[key] = peak;
+            }
+        }
+    } else {
+        // Legacy two-card layout: base card first, peak card second. Each card is
+        // a list of rows, so the peak cards have to be flattened - destructuring
+        // the card itself would yield an `undefined` key and drop the surcharge.
+        for (const { name, price } of cards[0]) models[name] = price;
+        for (const card of cards.slice(1)) {
+            for (const { name, price } of card) peakModels[name] = price;
+        }
+        // A model that only appears on the peak card has no separate base rate;
+        // it takes its peak value as the base so it is still priced.
+        for (const key of Object.keys(peakModels)) {
+            if (!(key in models)) {
+                models[key] = peakModels[key];
+                delete peakModels[key];
+            }
+        }
+    }
+
+    if (!Object.keys(models).length) return null;
+
+    // The page now states the rule as "Off-peak pricing apply outside 12:00 and
+    // 18:00 UTC on weekdays and all day on weekends"; the older wording was
+    // "Peak pricing applies between A and B UTC, Monday to Friday". Read both.
+    const peakRule = html.match(/Peak pricing applies between (\d{1,2}):(\d{2}) and (\d{1,2}):(\d{2}) UTC/i);
+    const offPeakRule = html.match(/[Oo]ff-?peak pricing appl(?:y|ies) outside (\d{1,2}):(\d{2}) and (\d{1,2}):(\d{2}) UTC/i);
+    const rule = peakRule ?? offPeakRule;
     return {
-        models: rateCard,
-        peakModels: peakCard ?? {},
+        models,
+        peakModels,
         peakHours: rule
             ? [{ start: Number(rule[1]) * 60 + Number(rule[2]), end: Number(rule[3]) * 60 + Number(rule[4]) }]
             : FALLBACK_OLLAMA_PEAK_HOURS,
@@ -323,21 +388,27 @@ export function init(router) {
         }
     });
 
-    // Session/weekly quota windows. Ollama API keys are not part of ST's secret
-    // store, so the UI passes one per request; it is forwarded and never stored.
+    // Credit balance for the account. Ollama API keys are not part of ST's
+    // secret store, so the UI passes one per request; it is forwarded and never
+    // stored. The endpoint changed from the session/weekly `limits` windows in
+    // /api/usage to USD credits in /api/balance (`included` + `purchased`), and
+    // /api/usage returns bucketed spend with no limits field at all, so this
+    // proxies the balance endpoint. Legacy plans still get their percentage
+    // windows back inside `included`, which the UI renders as before.
     router.get('/ollama/usage', async (req, res) => {
         try {
             const key = req.header('X-Ollama-Key') || '';
             if (!key) return res.status(400).json({ error: 'No Ollama API key configured' });
-            const upstream = await fetch(OLLAMA_USAGE_URL, {
+            const upstream = await fetch(OLLAMA_BALANCE_URL, {
                 headers: { Authorization: `Bearer ${key}`, Accept: 'application/json' },
                 signal: AbortSignal.timeout(15000),
             });
-            const body = await upstream.json();
+            const body = await upstream.json().catch(() => null);
+            if (!body) return res.status(502).json({ error: 'Ollama balance returned a non-JSON body' });
             return res.status(upstream.status).json(body);
         } catch (err) {
             console.error('[DeepSeek Usage Meter]', err.message);
-            return res.status(500).json({ error: 'Ollama usage request failed' });
+            return res.status(500).json({ error: 'Ollama balance request failed' });
         }
     });
 

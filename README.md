@@ -7,7 +7,7 @@ Server side of the usage meter. Serves live DeepSeek and Ollama Cloud pricing, t
 - `GET /api/plugins/deepseek-usage-meter/pricing` — DeepSeek rates + peak schedule, scraped from api-docs.deepseek.com
 - `GET /api/plugins/deepseek-usage-meter/balance` — DeepSeek balance, using the key already saved in SillyTavern
 - `GET /api/plugins/deepseek-usage-meter/ollama/pricing` — Ollama rates + peak card, scraped from ollama.com/pricing
-- `GET /api/plugins/deepseek-usage-meter/ollama/usage` — Ollama session/weekly quota; requires an `X-Ollama-Key` header (the UI sends the key from its settings, nothing is stored here)
+- `GET /api/plugins/deepseek-usage-meter/ollama/usage` — Ollama credit balance, proxied from `ollama.com/api/balance`; requires an `X-Ollama-Key` header (the UI sends the key from its settings, nothing is stored here). The path keeps its old name so existing installs do not break; Ollama's own `/api/usage` returns bucketed spend and no longer carries the session/weekly limits this used to read
 
 ## Install
 
