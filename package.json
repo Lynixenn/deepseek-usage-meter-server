@@ -5,6 +5,6 @@
   "description": "SillyTavern server plugin for DeepSeek usage tracking and balance",
   "main": "index.js",
   "scripts": {
-    "test": "node test-parse.mjs"
+    "test": "node test-parse.mjs && node test-bridge.mjs"
   }
 }

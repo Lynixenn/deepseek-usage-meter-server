@@ -1,6 +1,7 @@
 import express from 'express';
 import { getConfigValue } from '../../src/util.js';
 import { readSecret, SECRET_KEYS } from '../../src/endpoints/secrets.js';
+import { startBridge } from './ollama-bridge.js';
 
 export const info = {
     id: 'deepseek-usage-meter',
@@ -316,8 +317,45 @@ async function getOllamaPricing() {
     return ollamaPricingCache.data;
 }
 
-export function init(router) {
+// Native Ollama bridge. Read from config.yaml so a browser can never point it at
+// another host; a port of 0 turns it off.
+const DEFAULT_BRIDGE_PORT = 11435;
+const DEFAULT_OLLAMA_URL = 'http://127.0.0.1:11434';
+let bridge = { running: false, upstream: DEFAULT_OLLAMA_URL, error: 'Disabled', close: async () => { } };
+
+async function ollamaVersion(upstream) {
+    try {
+        const response = await fetch(`${upstream}/api/version`, { signal: AbortSignal.timeout(3000) });
+        return response.ok ? (await response.json()).version ?? null : null;
+    } catch {
+        return null;
+    }
+}
+
+export async function init(router) {
     router.use(authorize);
+
+    const bridgePort = Number(getConfigValue('deepseekUsageMeterOllamaPort', DEFAULT_BRIDGE_PORT));
+    if (bridgePort > 0) {
+        bridge = await startBridge({
+            port: bridgePort,
+            upstreamUrl: getConfigValue('deepseekUsageMeterOllamaUrl', DEFAULT_OLLAMA_URL),
+        });
+        if (bridge.running) console.log(`[DeepSeek Usage Meter] Ollama native bridge on ${bridge.url}, forwarding to ${bridge.upstream}`);
+        else console.warn(`[DeepSeek Usage Meter] Ollama native bridge did not start: ${bridge.error}`);
+    }
+
+    router.get('/ollama/native/status', async (req, res) => {
+        const version = bridge.running ? await ollamaVersion(bridge.upstream) : null;
+        res.json({
+            running: bridge.running,
+            url: bridge.url ?? null,
+            upstream: bridge.upstream,
+            error: bridge.error ?? null,
+            reachable: version !== null,
+            version,
+        });
+    });
 
     // Balance + prices, both pulled live from DeepSeek. Peak-hour pricing is
     // detected automatically from the announced Beijing-time window.
@@ -415,3 +453,6 @@ export function init(router) {
     console.log('[DeepSeek Usage Meter] Plugin loaded');
 }
 
+export async function exit() {
+    await bridge.close();
+}
